@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -145,6 +144,12 @@ func listen(l net.Listener, feConns *ebpf.Map, beConns *ebpf.Map, upstreamAddr s
 }
 
 func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string) {
+	defer func(r, l net.Addr) {
+		fmt.Printf("finished serving: %s->%s\n", r, l)
+	}(client.RemoteAddr(), client.LocalAddr())
+
+	defer func() { _ = client.Close() }()
+
 	// read the TLS ClientHello off the wire so that we can
 	// use it in routing decisions
 	clientHello, err := readClientHello(client)
@@ -167,6 +172,7 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		log.Printf("dialTCP(%s): %s", upstreamAddr, err)
 		return
 	}
+	defer func() { _ = upstream.Close() }()
 
 	// generate the clientKey used in the kernel-side SOCKHASH eBPF map
 	upstreamKey, err := newSocketKey(upstream)
@@ -183,16 +189,28 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		log.Printf("addToSockhash(be): %s\n", err)
 		return
 	}
+	defer func() {
+		if err = removeFromSockhash(beConns, clientKey); err != nil {
+			log.Printf("removeFromSockhash(be): %s\n", err)
+		}
+	}()
 
 	if err = addToSockhash(feConns, client, upstreamKey); err != nil {
 		log.Printf("addToSockhash(fe): %s\n", err)
 		return
 	}
+	defer func() {
+		if err = removeFromSockhash(feConns, upstreamKey); err != nil {
+			log.Printf("removeFromSockhash(fe): %s\n", err)
+		}
+	}()
 
 	// log.Printf("client %s -> %s (clientKey %#v) in be", client.RemoteAddr(), client.LocalAddr(), clientKey)
 	// log.Printf("upstream %s -> %s (clientKey %#v) in fe", upstream.LocalAddr(), upstream.RemoteAddr(), upstreamKey)
 
-	// now that everything is set up in our SOCKHASH maps, write the ClientHello upstream
+	// now that everything is set up in our SOCKHASH maps, write the
+	// ClientHello upstream.  This will trigger the ServerHello and "unblock"
+	// proxying between the client and upstream
 	n, err := upstream.Write(clientHello)
 	if err != nil {
 		log.Printf("upstream.Write(clientHello): %s\n", err)
@@ -203,8 +221,21 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		return
 	}
 
-	// TODO: how do we tell if we've had disconnects from upstream or downstream?
-	time.Sleep(time.Hour)
+	// TODO: we want to do a `upstream.Read()` just like we do for client just below,
+	//   but that has to live in a new goroutine.
+
+	// this should never return any data -- the BPF verdict programs
+	// redirect all packets before they can be read here.  This serves
+	// to notify us on connection close.
+	b := make([]byte, 1)
+	n, err = client.Read(b)
+
+	if n != 0 {
+		log.Printf("invariant broken: never expected to read bytes from socket")
+		return
+	}
+
+	// TODO: check/test against specific error types here
 }
 
 func addToSockhash(m *ebpf.Map, conn *net.TCPConn, key socketKey) error {
@@ -224,6 +255,15 @@ func addToSockhash(m *ebpf.Map, conn *net.TCPConn, key socketKey) error {
 	}
 	if innerError != nil {
 		return innerError
+	}
+
+	return nil
+}
+
+func removeFromSockhash(m *ebpf.Map, key socketKey) error {
+	err := m.Delete(&key)
+	if err != nil {
+		return fmt.Errorf("m.Delete: %w\n", err)
 	}
 
 	return nil

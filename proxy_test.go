@@ -23,6 +23,7 @@ const (
 
 func TestListenAndProxy(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Connection", "close")
 		_, _ = rw.Write([]byte(expectedBody))
 	}))
 	defer upstream.Close()
@@ -50,7 +51,7 @@ func TestListenAndProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("http.NewRequest: %s", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)
 
@@ -73,4 +74,6 @@ func TestListenAndProxy(t *testing.T) {
 	if string(body) != expectedBody {
 		t.Fatalf("unexpected body: %q", string(body))
 	}
+
+	time.Sleep(10 * time.Millisecond)
 }
