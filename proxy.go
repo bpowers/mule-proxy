@@ -6,15 +6,16 @@ package proxy
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"log"
 	"net"
 	"net/netip"
 	"strconv"
-	"syscall"
 	"time"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" bpf bpf_proxy.c
@@ -143,102 +144,56 @@ func listen(l net.Listener, feConns *ebpf.Map, beConns *ebpf.Map, upstreamAddr s
 	}
 }
 
-func serve(conn *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string) {
-	// read the client hello off the wire, as we want to make a routing
-	// decision based on it
-	clientHello, err := readClientHello(conn)
+func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string) {
+	// read the TLS ClientHello off the wire so that we can
+	// use it in routing decisions
+	clientHello, err := readClientHello(client)
 	if err != nil {
 		log.Printf("readClientHello: %s\n", err)
 		return
 	}
 
-	// log.Printf("read client hello len %d\n", len(clientHello))
-
 	// generate the key used in the kernel-side SOCKHASH eBPF map
-	key, err := newSocketKey(conn)
+	clientKey, err := newSocketKey(client)
 	if err != nil {
 		log.Printf("newSocketKey: %s\n", err)
 		return
 	}
 
-	// we need an integer FD for the eBPF program, so dup the conn
-	f, err := conn.File()
-	if err != nil {
-		log.Printf("conn.File: %s\n", err)
-		return
-	}
-
-	// close the original connection -- we only need `f`
-	if err = conn.Close(); err != nil {
-		log.Printf("conn.Close: %s\n", err)
-		return
-	}
-
-	// get that file descriptor from the Go *os.File
-	fd := int(f.Fd())
-
-	// IDK if we actually need this?
-	if err := syscall.SetNonblock(fd, true); err != nil {
-		log.Printf("syscall.SetNonblock: %s\n", err)
-		return
-	}
-
 	// TODO: rather than use a single upstreamAddr, call out to a func to find the
 	//   upstreamAddr based on the TLS ClientHello
-	upstreamConn, err := net.Dial("tcp", upstreamAddr)
+	upstream, err := dialTcp(upstreamAddr)
 	if err != nil {
-		log.Printf("net.Dial(%s): %s", upstreamAddr, err)
+		log.Printf("dialTCP(%s): %s", upstreamAddr, err)
 		return
 	}
 
-	// generate the key used in the kernel-side SOCKHASH eBPF map
-	upstreamKey, err := newSocketKey(upstreamConn)
+	// generate the clientKey used in the kernel-side SOCKHASH eBPF map
+	upstreamKey, err := newSocketKey(upstream)
 	if err != nil {
 		log.Printf("newSocketKey(upstream): %s", err)
 		return
 	}
 
-	// need the raw TCPConn for access to File() method
-	upstream, ok := upstreamConn.(*net.TCPConn)
-	if !ok {
-		log.Printf("expected upstream conn to be tcp")
-		return
-	}
-
-	// get that file descriptor from the Go *os.File
-	uf, err := upstream.File()
-	if err != nil {
-		log.Printf("upstream.File: %s", err)
-		return
-	}
-
-	// close the original connection -- we only need `uf`
-	if err = upstream.Close(); err != nil {
-		log.Printf("conn.Close: %s\n", err)
-		return
-	}
-
-	ufd := int(uf.Fd())
-
-	// we need to criss-cross keys + connections here: we use the client key
+	// we need to criss-cross keys + connections here: we use the client clientKey
 	// in the _backend_ map, so that we can route from frontend->backend and
 	// vice-versa.
 
-	if err := beConns.Update(&key, int64(ufd), ebpf.UpdateNoExist); err != nil {
-		log.Printf("conns.Update 2: %s\n", err)
+	if err = addToSockhash(beConns, upstream, clientKey); err != nil {
+		log.Printf("addToSockhash(be): %s\n", err)
 		return
 	}
 
-	if err := feConns.Update(&upstreamKey, int64(fd), ebpf.UpdateNoExist); err != nil {
-		log.Printf("conns.Update 1: %s\n", err)
+	if err = addToSockhash(feConns, client, upstreamKey); err != nil {
+		log.Printf("addToSockhash(fe): %s\n", err)
 		return
 	}
 
-	// log.Printf("client %s -> %s (key %#v) in be", conn.RemoteAddr(), conn.LocalAddr(), key)
-	// log.Printf("upstream %s -> %s (key %#v) in fe", upstream.LocalAddr(), upstream.RemoteAddr(), upstreamKey)
+	// log.Printf("client %s -> %s (clientKey %#v) in be", client.RemoteAddr(), client.LocalAddr(), clientKey)
+	// log.Printf("upstream %s -> %s (clientKey %#v) in fe", upstream.LocalAddr(), upstream.RemoteAddr(), upstreamKey)
 
 	// now that everything is set up in our SOCKHASH maps, write the ClientHello upstream
-	n, err := uf.Write(clientHello)
+	n, err := upstream.Write(clientHello)
 	if err != nil {
 		log.Printf("upstream.Write(clientHello): %s\n", err)
 		return
@@ -248,8 +203,30 @@ func serve(conn *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string) {
 		return
 	}
 
-	// TODO: clean everything up and stuff
+	// TODO: how do we tell if we've had disconnects from upstream or downstream?
 	time.Sleep(time.Hour)
+}
+
+func addToSockhash(m *ebpf.Map, conn *net.TCPConn, key socketKey) error {
+	sc, err := conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("conn.SyscallConn: %w\n", err)
+	}
+	var innerError error
+	err = sc.Control(func(fd uintptr) {
+		if err := m.Update(&key, int64(fd), ebpf.UpdateNoExist); err != nil {
+			innerError = fmt.Errorf("conns.Update: %w\n", err)
+			return
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("uc.Control: %w\n", err)
+	}
+	if innerError != nil {
+		return innerError
+	}
+
+	return nil
 }
 
 func readClientHello(conn net.Conn) ([]byte, error) {
@@ -276,4 +253,19 @@ func readClientHello(conn net.Conn) ([]byte, error) {
 	clientHello = clientHello[:clientHelloLen+5]
 
 	return clientHello, nil
+}
+
+func dialTcp(addr string) (*net.TCPConn, error) {
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("net.Dial(%s): %s", addr, err)
+	}
+
+	// need the raw TCPConn for access to File() method
+	tconn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return nil, errors.New("expected upstream conn to be tcp")
+	}
+
+	return tconn, nil
 }
