@@ -195,14 +195,28 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		return
 	}
 
-	// TODO: we want to do a `upstream.Read()` just like we do for client just below,
-	//   but that has to live in a new goroutine.
+	clientChan := make(chan struct{})
+	upstreamChan := make(chan struct{})
+
+	go notifyOnClose(client, clientChan)
+	go notifyOnClose(upstream, upstreamChan)
+
+	// don't return from this function until either a client or upstream
+	// connection closes
+	select {
+	case <-clientChan:
+	case <-upstreamChan:
+	}
+}
+
+func notifyOnClose(conn *net.TCPConn, done chan<- struct{}) {
+	defer func() { close(done) }()
 
 	// this should never return any data -- the BPF verdict programs
 	// redirect all packets before they can be read here.  This serves
 	// to notify us on connection close.
 	b := make([]byte, 1)
-	n, err = client.Read(b)
+	n, err := conn.Read(b)
 
 	if n != 0 {
 		log.Printf("invariant broken: never expected to read bytes from socket")
@@ -210,6 +224,7 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 	}
 
 	// TODO: check/test against specific error types here
+	_ = err
 }
 
 func addToSockhash(m *ebpf.Map, conn *net.TCPConn, key socketKey) error {
