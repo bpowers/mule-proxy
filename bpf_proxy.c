@@ -8,6 +8,7 @@
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
 #define MAX_CONN_ENTRIES 128
 
@@ -21,10 +22,18 @@
 // TODO: ipv6 support
 struct socket_key {
   __u32 local_ip;
-  __u32 local_port;  // little-endian
+  __u32 local_port;
   __u32 remote_ip;
-  __u32 remote_port;  // big-endian
+  __u32 remote_port;
 };
+
+void socket_key_init(struct socket_key *key, const struct __sk_buff *skb) {
+  key->local_ip = skb->local_ip4;
+  key->local_port = skb->local_port;
+  key->remote_ip = skb->remote_ip4;
+  // sk_buff's local_port is native-endian (little), but remote port is network (big)
+  key->remote_port = bpf_ntohl(skb->remote_port);
+}
 
 struct {
   __uint(type, BPF_MAP_TYPE_SOCKHASH);
@@ -48,12 +57,8 @@ int mule_generic_parser(struct __sk_buff *skb) {
 
 SEC("sk_skb/stream_verdict")
 int mule_frontend_verdict(struct __sk_buff *skb) {
-  struct socket_key key = {
-      .local_ip = skb->local_ip4,
-      .local_port = skb->local_port,
-      .remote_ip = skb->remote_ip4,
-      .remote_port = skb->remote_port >> 16,  // remote port is in the upper half
-  };
+  struct socket_key key;
+  socket_key_init(&key, skb);
   // flags is 0, because skb is an ingress packet, but we want to redirect
   // it to the egress path on the other side
   return bpf_sk_redirect_hash(skb, &backend_conns, &key, 0);
@@ -61,12 +66,8 @@ int mule_frontend_verdict(struct __sk_buff *skb) {
 
 SEC("sk_skb/stream_verdict")
 int mule_backend_verdict(struct __sk_buff *skb) {
-  struct socket_key key = {
-      .local_ip = skb->local_ip4,
-      .local_port = skb->local_port,
-      .remote_ip = skb->remote_ip4,
-      .remote_port = skb->remote_port >> 16,  // remote port is in the upper half
-  };
+  struct socket_key key;
+  socket_key_init(&key, skb);
   // flags is 0, because skb is an ingress packet, but we want to redirect
   // it to the egress path on the other side
   return bpf_sk_redirect_hash(skb, &frontend_conns, &key, 0);

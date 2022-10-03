@@ -8,13 +8,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"log"
 	"net"
 	"net/netip"
-	"strconv"
-
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" bpf bpf_proxy.c
@@ -31,51 +29,27 @@ func ip4AsInt(ip netip.Addr) uint32 {
 	return binary.LittleEndian.Uint32(v4[:])
 }
 
-// htons assumes it is running on a little endian system
-func htons(i uint16) uint16 {
-	b := make([]byte, 2)
-	binary.LittleEndian.PutUint16(b, i)
-	return binary.BigEndian.Uint16(b)
-}
-
-// newSocketKey matches the key we use in bpf where annoyingly, on the kernel side,
-// things are stored in network byte order.
+// newSocketKey matches the key we use in bpf
 func newSocketKey(c net.Conn) (socketKey, error) {
-	remoteIp, remotePortStr, err := net.SplitHostPort(c.RemoteAddr().String())
-	if err != nil {
-		return socketKey{}, err
-	}
-	remotePort, err := strconv.Atoi(remotePortStr)
-	if err != nil {
-		return socketKey{}, err
-	}
-	remote, err := netip.ParseAddr(remoteIp)
+	remote, err := netip.ParseAddrPort(c.RemoteAddr().String())
 	if err != nil {
 		return socketKey{}, err
 	}
 
-	localIp, localPortStr, err := net.SplitHostPort(c.LocalAddr().String())
-	if err != nil {
-		return socketKey{}, err
-	}
-	localPort, err := strconv.Atoi(localPortStr)
-	if err != nil {
-		return socketKey{}, err
-	}
-	local, err := netip.ParseAddr(localIp)
+	local, err := netip.ParseAddrPort(c.LocalAddr().String())
 	if err != nil {
 		return socketKey{}, err
 	}
 
-	if !local.Is4() || !remote.Is4() {
+	if !local.Addr().Is4() || !remote.Addr().Is4() {
 		return socketKey{}, fmt.Errorf("expected IPs to be v4, v6 not yet supported")
 	}
 
 	return socketKey{
-		LocalIp:    ip4AsInt(local),
-		LocalPort:  uint32(localPort),
-		RemoteIp:   ip4AsInt(remote),
-		RemotePort: uint32(htons(uint16(remotePort))),
+		LocalIp:    ip4AsInt(local.Addr()),
+		LocalPort:  uint32(local.Port()),
+		RemoteIp:   ip4AsInt(remote.Addr()),
+		RemotePort: uint32(remote.Port()),
 	}, nil
 }
 
