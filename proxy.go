@@ -106,7 +106,7 @@ func listen(l net.Listener, feConns *ebpf.Map, beConns *ebpf.Map, upstreamAddr s
 			return fmt.Errorf("accept: %w", err)
 		}
 
-		fmt.Printf("accepted connection: %s->%s\n", conn.RemoteAddr(), conn.LocalAddr())
+		// fmt.Printf("accepted connection: %s->%s\n", conn.RemoteAddr(), conn.LocalAddr())
 
 		tcpConn, ok := conn.(*net.TCPConn)
 		if !ok {
@@ -118,9 +118,9 @@ func listen(l net.Listener, feConns *ebpf.Map, beConns *ebpf.Map, upstreamAddr s
 }
 
 func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string) {
-	defer func(r, l net.Addr) {
-		fmt.Printf("finished serving: %s->%s\n", r, l)
-	}(client.RemoteAddr(), client.LocalAddr())
+	//defer func(r, l net.Addr) {
+	//	fmt.Printf("finished serving: %s->%s\n", r, l)
+	//}(client.RemoteAddr(), client.LocalAddr())
 
 	defer func() { _ = client.Close() }()
 
