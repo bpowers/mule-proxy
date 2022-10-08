@@ -39,7 +39,7 @@ func TestListenAndProxy(t *testing.T) {
 	log.Printf("mule listening at %s", listener.Addr())
 
 	go func() {
-		if err := ListenAndProxy(listener, upstream.Listener.Addr()); err != nil {
+		if err := ListenAndProxy(listener, upstream.Listener.Addr(), false); err != nil {
 			if !strings.Contains(err.Error(), "use of closed network connection") {
 				t.Fatalf("ListenAndProxy: %s", err)
 			}
@@ -148,7 +148,7 @@ func l4listenAndProxy(l net.Listener, upstreamAddr string) error {
 	}
 }
 
-func benchmarkNewConn(b *testing.B, enableMule, enableGoL4 bool) {
+func benchmarkNewConn(b *testing.B, enableMule, enableGoL4, dupFDs bool) {
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		// rw.Header().Set("Connection", "close")
 		_, _ = rw.Write([]byte(expectedBody))
@@ -167,7 +167,7 @@ func benchmarkNewConn(b *testing.B, enableMule, enableGoL4 bool) {
 		defer listener.Close()
 
 		go func() {
-			if err := ListenAndProxy(listener, upstream.Listener.Addr()); err != nil {
+			if err := ListenAndProxy(listener, upstream.Listener.Addr(), dupFDs); err != nil {
 				if !strings.Contains(err.Error(), "use of closed network connection") {
 					b.Fatalf("ListenAndProxy: %s", err)
 				}
@@ -233,13 +233,17 @@ func benchmarkNewConn(b *testing.B, enableMule, enableGoL4 bool) {
 }
 
 func BenchmarkNewConnBaseline(b *testing.B) {
-	benchmarkNewConn(b, false, false)
+	benchmarkNewConn(b, false, false, false)
 }
 
 func BenchmarkNewConnMule(b *testing.B) {
-	benchmarkNewConn(b, true, false)
+	benchmarkNewConn(b, true, false, false)
 }
 
 func BenchmarkNewConnGo(b *testing.B) {
-	benchmarkNewConn(b, false, true)
+	benchmarkNewConn(b, false, true, false)
+}
+
+func BenchmarkNewConnMuleFDsDuped(b *testing.B) {
+	benchmarkNewConn(b, true, false, true)
 }

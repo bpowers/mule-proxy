@@ -10,9 +10,12 @@ import (
 	"fmt"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"io"
 	"log"
 	"net"
 	"net/netip"
+	"os"
+	"syscall"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" bpf bpf_proxy.c
@@ -53,7 +56,7 @@ func newSocketKey(c net.Conn) (socketKey, error) {
 	}, nil
 }
 
-func ListenAndProxy(l net.Listener, upstream net.Addr) error {
+func ListenAndProxy(l net.Listener, upstream net.Addr, dupFDs bool) error {
 	// load objects into the kernel
 	objs := bpfObjects{}
 	if err := loadBpfObjects(&objs, nil); err != nil {
@@ -117,12 +120,25 @@ func listen(l net.Listener, feConns *ebpf.Map, beConns *ebpf.Map, upstreamAddr s
 	}
 }
 
+func dupFdAndCloseOrig(c *net.TCPConn) (*os.File, error) {
+	// we need an integer FD for the eBPF program, so dup the conn
+	f, err := c.File()
+	if err != nil {
+		return nil, fmt.Errorf("conn.File: %w", err)
+	}
+
+	// close the original connection -- we only need `f`
+	if err = c.Close(); err != nil {
+		return nil, fmt.Errorf("conn.Close: %w", err)
+	}
+
+	return f, nil
+}
+
 func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string) {
 	//defer func(r, l net.Addr) {
 	//	fmt.Printf("finished serving: %s->%s\n", r, l)
 	//}(client.RemoteAddr(), client.LocalAddr())
-
-	defer func() { _ = client.Close() }()
 
 	// read the TLS ClientHello off the wire so that we can
 	// use it in routing decisions
@@ -139,6 +155,14 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		return
 	}
 
+	clientFd, err := dupFdAndCloseOrig(client)
+	if err != nil {
+		log.Printf("dupFd: %s\n", err)
+		return
+	}
+	client = nil
+	defer func() { _ = clientFd.Close() }()
+
 	// TODO: rather than use a single upstreamAddr, call out to a func to find the
 	//   upstreamAddr based on the TLS ClientHello
 	upstream, err := dialTcp(upstreamAddr)
@@ -146,7 +170,6 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		log.Printf("dialTCP(%s): %s", upstreamAddr, err)
 		return
 	}
-	defer func() { _ = upstream.Close() }()
 
 	// generate the clientKey used in the kernel-side SOCKHASH eBPF map
 	upstreamKey, err := newSocketKey(upstream)
@@ -155,11 +178,19 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		return
 	}
 
+	upstreamFd, err := dupFdAndCloseOrig(upstream)
+	if err != nil {
+		log.Printf("dupFd: %s\n", err)
+		return
+	}
+	upstream = nil
+	defer func() { _ = upstreamFd.Close() }()
+
 	// we need to criss-cross keys + connections here: we use the client clientKey
 	// in the _backend_ map, so that we can route from frontend->backend and
 	// vice-versa.
 
-	if err = addToSockhash(beConns, upstream, clientKey); err != nil {
+	if err = addToSockhash(beConns, upstreamFd, clientKey); err != nil {
 		log.Printf("addToSockhash(be): %s\n", err)
 		return
 	}
@@ -169,7 +200,7 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 		}
 	}()
 
-	if err = addToSockhash(feConns, client, upstreamKey); err != nil {
+	if err = addToSockhash(feConns, clientFd, upstreamKey); err != nil {
 		log.Printf("addToSockhash(fe): %s\n", err)
 		return
 	}
@@ -185,7 +216,7 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 	// now that everything is set up in our SOCKHASH maps, write the
 	// ClientHello upstream.  This will trigger the ServerHello and "unblock"
 	// proxying between the client and upstream
-	n, err := upstream.Write(clientHello)
+	n, err := upstreamFd.Write(clientHello)
 	if err != nil {
 		log.Printf("upstream.Write(clientHello): %s\n", err)
 		return
@@ -198,8 +229,8 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 	clientChan := make(chan struct{})
 	upstreamChan := make(chan struct{})
 
-	go notifyOnClose(client, clientChan)
-	go notifyOnClose(upstream, upstreamChan)
+	go notifyOnClose(clientFd, clientChan)
+	go notifyOnClose(upstreamFd, upstreamChan)
 
 	// don't return from this function until either a client or upstream
 	// connection closes
@@ -209,7 +240,7 @@ func serve(client *net.TCPConn, feConns, beConns *ebpf.Map, upstreamAddr string)
 	}
 }
 
-func notifyOnClose(conn *net.TCPConn, done chan<- struct{}) {
+func notifyOnClose(conn io.Reader, done chan<- struct{}) {
 	defer func() { close(done) }()
 
 	// this should never return any data -- the BPF verdict programs
@@ -227,7 +258,11 @@ func notifyOnClose(conn *net.TCPConn, done chan<- struct{}) {
 	_ = err
 }
 
-func addToSockhash(m *ebpf.Map, conn *net.TCPConn, key socketKey) error {
+type syscallConner interface {
+	SyscallConn() (syscall.RawConn, error)
+}
+
+func addToSockhash(m *ebpf.Map, conn syscallConner, key socketKey) error {
 	sc, err := conn.SyscallConn()
 	if err != nil {
 		return fmt.Errorf("conn.SyscallConn: %w\n", err)
