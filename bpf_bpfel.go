@@ -63,7 +63,6 @@ type bpfSpecs struct {
 type bpfProgramSpecs struct {
 	MuleBackendVerdict  *ebpf.ProgramSpec `ebpf:"mule_backend_verdict"`
 	MuleFrontendVerdict *ebpf.ProgramSpec `ebpf:"mule_frontend_verdict"`
-	MuleGenericParser   *ebpf.ProgramSpec `ebpf:"mule_generic_parser"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
@@ -110,14 +109,12 @@ func (m *bpfMaps) Close() error {
 type bpfPrograms struct {
 	MuleBackendVerdict  *ebpf.Program `ebpf:"mule_backend_verdict"`
 	MuleFrontendVerdict *ebpf.Program `ebpf:"mule_frontend_verdict"`
-	MuleGenericParser   *ebpf.Program `ebpf:"mule_generic_parser"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
 		p.MuleBackendVerdict,
 		p.MuleFrontendVerdict,
-		p.MuleGenericParser,
 	)
 }
 

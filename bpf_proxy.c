@@ -49,12 +49,6 @@ struct {
   __uint(max_entries, MAX_CONN_ENTRIES);
 } backend_conns SEC(".maps");
 
-// usable by both frontend and backend
-SEC("sk_skb/stream_parser")
-int mule_generic_parser(struct __sk_buff *skb) {
-  return skb->len;
-}
-
 SEC("sk_skb/stream_verdict")
 int mule_frontend_verdict(struct __sk_buff *skb) {
   struct socket_key key;

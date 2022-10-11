@@ -65,26 +65,8 @@ func ListenAndProxy(l net.Listener, upstream net.Addr, dupFDs bool) error {
 
 	err := link.RawAttachProgram(link.RawAttachProgramOptions{
 		Target:  objs.FrontendConns.FD(),
-		Program: objs.MuleGenericParser,
-		Attach:  ebpf.AttachSkSKBStreamParser,
-	})
-	if err != nil {
-		return err
-	}
-
-	err = link.RawAttachProgram(link.RawAttachProgramOptions{
-		Target:  objs.FrontendConns.FD(),
 		Program: objs.MuleFrontendVerdict,
 		Attach:  ebpf.AttachSkSKBStreamVerdict,
-	})
-	if err != nil {
-		return err
-	}
-
-	err = link.RawAttachProgram(link.RawAttachProgramOptions{
-		Target:  objs.BackendConns.FD(),
-		Program: objs.MuleGenericParser,
-		Attach:  ebpf.AttachSkSKBStreamParser,
 	})
 	if err != nil {
 		return err
